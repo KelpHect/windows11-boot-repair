@@ -192,13 +192,37 @@ if (-not $DryRun) {
         Write-Warn 'BCD backup skipped (bcdedit unavailable in Safe Boot)'
     }
 
-    foreach ($hive in 'SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT', 'NTUSER.DAT') {
-        $source = Join-Path "$env:SystemRoot\System32\config" $hive
-        if (Test-Path $source) {
-            Copy-Item $source "$backupRoot\$hive.bak" -Force -ErrorAction SilentlyContinue
+    # Live registry hives are locked by the running OS, so Copy-Item cannot
+    # read them. Use `reg save`, which uses backup semantics and works on
+    # in-use hives. Each hive is guarded so a single failure never aborts
+    # the whole repair run.
+    $hives = @(
+        @{ Key = 'HKLM\SYSTEM';   File = 'SYSTEM.bak'   },
+        @{ Key = 'HKLM\SOFTWARE'; File = 'SOFTWARE.bak' },
+        @{ Key = 'HKLM\SAM';      File = 'SAM.bak'      },
+        @{ Key = 'HKLM\SECURITY'; File = 'SECURITY.bak' },
+        @{ Key = 'HKU\.DEFAULT';   File = 'DEFAULT.bak'  },
+        @{ Key = 'HKCU';           File = 'NTUSER.DAT.bak' }
+    )
+    $savedCount = 0
+    foreach ($hive in $hives) {
+        $dest = Join-Path $backupRoot $hive.File
+        try {
+            & reg save $hive.Key $dest /y 2>$null | Out-Null
+            if ((-not $LASTEXITCODE) -or $LASTEXITCODE -eq 0) {
+                if (Test-Path $dest) { $savedCount++ }
+            }
+        }
+        catch {
+            Write-Warn "Could not save hive $($hive.Key): $($_.Exception.Message)"
         }
     }
-    Write-Ok 'Registry hives backed up'
+    if ($savedCount -gt 0) {
+        Write-Ok "Registry hives backed up ($savedCount/$($hives.Count))"
+    }
+    else {
+        Write-Warn 'No registry hives could be saved (live hives locked). Continuing anyway.'
+    }
 
     try {
         Get-Service |
