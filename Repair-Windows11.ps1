@@ -384,24 +384,15 @@ else {
 }
 
 # ============================================================================
-# 5. System file and component store repair (with pre/post health checks)
+# 5. System file and component store repair
 # ============================================================================
 Write-Section '5. Repair System Files and Component Store'
 
-Write-Step 'DISM pre-check: ScanHealth (component store corruption scan)'
-$scanPre = Invoke-RepairStep 'DISM /ScanHealth' {
-    & dism /online /cleanup-image /scanhealth 2>&1 |
-        Out-String |
-        Write-Host
-}
-if (-not $scanPre) { Write-Info 'Pre ScanHealth reported issues (expected if corrupted).' }
-
-Write-Step 'DISM pre-check: GetHealth (no-repair health status)'
-Invoke-RepairStep 'DISM /GetHealth' {
-    & dism /online /cleanup-image /gethealth 2>&1 |
-        Out-String |
-        Write-Host
-} | Out-Null
+# NOTE: DISM /ScanHealth and /GetHealth were intentionally removed. On some
+# Windows 11 builds (e.g. Build 26200) those informational switches return exit
+# code 87 (ERROR_INVALID_PARAMETER) instead of a health status, which produces
+# misleading "failed" output without repairing anything. The actual repair
+# steps below (sfc and DISM /RestoreHealth) are universally valid.
 
 $sfcOk = Invoke-RepairStep 'SFC /scannow (system file checker)' {
     & sfc /scannow 2>&1 |
@@ -426,13 +417,6 @@ if (-not $DryRun -and (Test-Path $installWim -ErrorAction SilentlyContinue)) {
     } | Out-Null
     $script:wimSourceUsed = $true
 }
-
-Write-Step 'DISM post-check: GetHealth (confirm component store is healthy)'
-Invoke-RepairStep 'DISM /GetHealth (post)' {
-    & dism /online /cleanup-image /gethealth 2>&1 |
-        Out-String |
-        Write-Host
-} | Out-Null
 
 # ============================================================================
 # 6. Disk and file system integrity

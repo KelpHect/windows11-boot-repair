@@ -27,10 +27,11 @@ repair step is not weakened.
 4. **Revert pending installation** — `dism /revertpendingactions` plus a full reset
    of the Windows Update components (`SoftwareDistribution`, `catroot2`, and the
    related services).
-5. **System file and component store repair** — DISM pre-checks (`/ScanHealth`,
-   `/GetHealth`), `sfc /scannow`, `dism /online /cleanup-image /restorehealth`
-   (cloud via Windows Update), optional `install.wim` source, and a DISM
-   `/GetHealth` post-check to confirm the component store is healthy.
+5. **System file and component store repair** — `sfc /scannow` and
+   `dism /online /cleanup-image /restorehealth` (cloud via Windows Update), plus
+   optional `install.wim` source. (The informational `/ScanHealth` and `/GetHealth`
+   switches were removed — they return exit code 87 on some Windows 11 builds and
+   repair nothing.)
 6. **Disk and file system integrity** — schedules `chkdsk C: /f /r /x` for the
    next boot and reports SMART health for each physical disk.
 7. **Boot configuration (BCD)** — dumps the current store, restores common boot
@@ -133,8 +134,6 @@ Full coverage run (shrink the component store and schedule a memory test too):
 | Windows tool | In script | Where |
 | --- | --- | --- |
 | `sfc /scannow` | yes | Phase 5 |
-| `DISM /ScanHealth` (pre-check) | yes | Phase 5 |
-| `DISM /GetHealth` (pre + post) | yes | Phase 5 |
 | `DISM /RestoreHealth` (cloud via Windows Update) | yes | Phase 5 |
 | `DISM /RestoreHealth` with offline `install.wim` | yes (if `D:\sources\install.wim` exists) | Phase 5 |
 | `DISM /StartComponentCleanup` + `/ResetBase` | yes (`-CleanComponentStore`) | Phase 9 |
