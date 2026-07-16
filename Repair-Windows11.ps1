@@ -1,15 +1,22 @@
 <#
 .SYNOPSIS
-    Windows 11 Boot Repair and Recovery Tool.
+    Windows 11 Boot Repair and Recovery Tool (full coverage).
 
 .DESCRIPTION
     A safe-mode-oriented PowerShell 5.1 repair script for Windows 11 that will
     not boot normally after a failed or incompatible update, corrupted system
     files, broken boot configuration, or damaged component store.
 
-    Runs diagnostics, removes a problematic update, repairs system files and the
-    component store, checks disk integrity, repairs the boot configuration, and
-    restores sane service and update defaults.
+    Runs the full built-in Windows repair toolchain: DISM pre/post health
+    checks, SFC, DISM /RestoreHealth (cloud + offline source), component store
+    cleanup, bad-update removal, pending-action revert, Windows Update component
+    reset, CHKDSK, SMART, BCD dump, bcdboot boot-file rebuild on the EFI System
+    Partition, network stack reset, Defender defaults restore, System Restore
+    point listing and optional rollback, and optional Windows Memory Diagnostic
+    scheduling.
+
+    Windows Update is paused only at the very end (after all repairs) so the
+    cloud repair step is not weakened.
 
     Intended to be run from Safe Mode with Networking as an Administrator.
 
@@ -25,6 +32,18 @@
 .PARAMETER BadKb
     One or more KB numbers to uninstall (for example -BadKb 5046617,5046613).
 
+.PARAMETER CleanComponentStore
+    Run DISM /StartComponentCleanup (and /ResetBase) to shrink the component
+    store after repairs. Maintenance only; not required for boot repair.
+
+.PARAMETER ScheduleMemTest
+    Launch Windows Memory Diagnostic (mdsched.exe) so you can schedule a memory
+    test for the next boot. Requires the small GUI dialog to confirm.
+
+.PARAMETER RestorePoint
+    Sequence number of a System Restore point to roll back to. Use without a
+    value first to list available points, then re-run with the chosen sequence.
+
 .EXAMPLE
     .\Repair-Windows11.ps1 -DryRun
 
@@ -34,6 +53,11 @@
     .\Repair-Windows11.ps1 -BadKb 5046617
 
     Runs all repairs and uninstalls KB5046617.
+
+.EXAMPLE
+    .\Repair-Windows11.ps1 -RestorePoint 3
+
+    Rolls the system back to restore point sequence number 3 (after confirmation).
 
 .NOTES
     Requires Administrator privileges and PowerShell 5.1 or later.
@@ -49,7 +73,10 @@ param(
     [switch] $DryRun,
     [switch] $NoReboot,
     [switch] $SkipUninstall,
-    [string[]] $BadKb
+    [string[]] $BadKb,
+    [switch] $CleanComponentStore,
+    [switch] $ScheduleMemTest,
+    [int] $RestorePoint = -1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -112,7 +139,7 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 $modeText = if ($DryRun) { 'DRY-RUN (no changes will be made)' } else { 'LIVE' }
 Write-Host @"
 ####################################################################
-#  Windows 11 Boot Repair and Recovery Tool                         #
+#  Windows 11 Boot Repair and Recovery Tool (full coverage)         #
 #  Mode: $modeText
 #  Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 ####################################################################
@@ -123,6 +150,7 @@ if ($DryRun) {
 }
 
 $anyFailures = $false
+$wimSourceUsed = $false
 
 # ============================================================================
 # 1. Environment snapshot
@@ -177,8 +205,8 @@ else {
 # ============================================================================
 Write-Section '2. Backup Critical Config (BCD, Registry, Services)'
 
-$timestamp    = Get-Date -Format 'yyyyMMdd_HHmmss'
-$backupRoot   = "$env:SystemDrive\RepairBackup_$timestamp"
+$timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+$backupRoot = "$env:SystemDrive\RepairBackup_$timestamp"
 
 if (-not $DryRun) {
     New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
@@ -201,8 +229,8 @@ if (-not $DryRun) {
         @{ Key = 'HKLM\SOFTWARE'; File = 'SOFTWARE.bak' },
         @{ Key = 'HKLM\SAM';      File = 'SAM.bak'      },
         @{ Key = 'HKLM\SECURITY'; File = 'SECURITY.bak' },
-        @{ Key = 'HKU\.DEFAULT';   File = 'DEFAULT.bak'  },
-        @{ Key = 'HKCU';           File = 'NTUSER.DAT.bak' }
+        @{ Key = 'HKU\.DEFAULT';  File = 'DEFAULT.bak'  },
+        @{ Key = 'HKCU';          File = 'NTUSER.DAT.bak' }
     )
     $savedCount = 0
     foreach ($hive in $hives) {
@@ -306,15 +334,8 @@ else {
         Write-Info 'No -BadKb supplied. Review the list above and re-run with -BadKb <number>.'
     }
 
-    if (-not $DryRun) {
-        Write-Step 'Pausing Windows Update so the bad update is not re-delivered'
-        $auPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
-        if (-not (Test-Path $auPath)) {
-            New-Item -Path $auPath -Force | Out-Null
-        }
-        Set-ItemProperty -Path $auPath -Name 'NoAutoUpdate' -Value 1 -Type DWord -Force
-        Write-Ok 'Auto-update disabled via policy'
-    }
+    # NOTE: Windows Update is paused only at the end (Section 11) so the cloud
+    # repair step (DISM /RestoreHealth) is not weakened while repairs run.
 }
 
 # ============================================================================
@@ -335,10 +356,10 @@ if (-not $DryRun) {
         try { Stop-Service -Name $service -Force -ErrorAction SilentlyContinue } catch {}
     }
 
-    $softwareDistribution      = "$env:SystemRoot\SoftwareDistribution"
-    $softwareDistributionBak  = "$env:SystemRoot\SoftwareDistribution.bak"
-    $catroot2                  = "$env:SystemRoot\System32\catroot2"
-    $catroot2Bak               = "$env:SystemRoot\System32\catroot2.bak"
+    $softwareDistribution     = "$env:SystemRoot\SoftwareDistribution"
+    $softwareDistributionBak = "$env:SystemRoot\SoftwareDistribution.bak"
+    $catroot2                 = "$env:SystemRoot\System32\catroot2"
+    $catroot2Bak              = "$env:SystemRoot\System32\catroot2.bak"
 
     if (Test-Path $softwareDistributionBak) {
         Remove-Item $softwareDistributionBak -Recurse -Force -ErrorAction SilentlyContinue
@@ -363,9 +384,24 @@ else {
 }
 
 # ============================================================================
-# 5. System file and component store repair
+# 5. System file and component store repair (with pre/post health checks)
 # ============================================================================
 Write-Section '5. Repair System Files and Component Store'
+
+Write-Step 'DISM pre-check: ScanHealth (component store corruption scan)'
+$scanPre = Invoke-RepairStep 'DISM /ScanHealth' {
+    & dism /online /cleanup-image /scanhealth 2>&1 |
+        Out-String |
+        Write-Host
+}
+if (-not $scanPre) { Write-Info 'Pre ScanHealth reported issues (expected if corrupted).' }
+
+Write-Step 'DISM pre-check: GetHealth (no-repair health status)'
+Invoke-RepairStep 'DISM /GetHealth' {
+    & dism /online /cleanup-image /gethealth 2>&1 |
+        Out-String |
+        Write-Host
+} | Out-Null
 
 $sfcOk = Invoke-RepairStep 'SFC /scannow (system file checker)' {
     & sfc /scannow 2>&1 |
@@ -374,7 +410,7 @@ $sfcOk = Invoke-RepairStep 'SFC /scannow (system file checker)' {
 }
 if (-not $sfcOk) { $script:anyFailures = $true }
 
-$dismOk = Invoke-RepairStep 'DISM /RestoreHealth (component store repair)' {
+$dismOk = Invoke-RepairStep 'DISM /RestoreHealth (component store repair; cloud via Windows Update)' {
     & dism /online /cleanup-image /restorehealth 2>&1 |
         Out-String |
         Write-Host
@@ -388,7 +424,15 @@ if (-not $DryRun -and (Test-Path $installWim -ErrorAction SilentlyContinue)) {
             Out-String |
             Write-Host
     } | Out-Null
+    $script:wimSourceUsed = $true
 }
+
+Write-Step 'DISM post-check: GetHealth (confirm component store is healthy)'
+Invoke-RepairStep 'DISM /GetHealth (post)' {
+    & dism /online /cleanup-image /gethealth 2>&1 |
+        Out-String |
+        Write-Host
+} | Out-Null
 
 # ============================================================================
 # 6. Disk and file system integrity
@@ -422,9 +466,9 @@ else {
 }
 
 # ============================================================================
-# 7. Boot configuration (BCD) repair
+# 7. Boot configuration (BCD) repair + bcdboot boot-file rebuild
 # ============================================================================
-Write-Section '7. Boot Configuration (BCD) Repair'
+Write-Section '7. Boot Configuration (BCD) Repair + bcdboot'
 
 Write-Step 'Show current BCD entries'
 if (-not $DryRun) {
@@ -441,6 +485,79 @@ else {
     Write-Info '(dry-run) would dump BCD'
 }
 
+if (-not $DryRun) {
+    Write-Step 'Restoring common boot defaults'
+    & bcdedit /set nx AlwaysOn 2>$null | Out-Null
+    Write-Ok 'nx (DEP) set to AlwaysOn'
+}
+else {
+    Write-Info '(dry-run) would set nx AlwaysOn'
+}
+
+# --- bcdboot: rebuild boot files on the EFI System Partition ------------------
+Write-Step 'Rebuild boot files with bcdboot'
+if (-not $DryRun) {
+    $espPartition = $null
+    $tempLetter   = $null
+    try {
+        # GPT EFI System Partition type GUID
+        $espGuid = '{C12A7328-F81F-11D2-BA4B-00A0C93EC93B}'
+        $espPartition = Get-Partition -ErrorAction SilentlyContinue |
+            Where-Object { $_.GPTType -eq $espGuid } |
+            Select-Object -First 1
+
+        if ($espPartition) {
+            Write-Info "EFI System Partition found on Disk $($espPartition.DiskNumber) Partition $($espPartition.PartitionNumber)"
+            # Ensure it has a drive letter so bcdboot can target it
+            if (-not $espPartition.DriveLetter -or $espPartition.DriveLetter -eq 0) {
+                $tempLetter = 'Z'
+                Add-PartitionAccessPath -DiskNumber $espPartition.DiskNumber -PartitionNumber $espPartition.PartitionNumber -AccessPath "$tempLetter`:\" -ErrorAction SilentlyContinue | Out-Null
+                Write-Info "Temporarily assigned drive letter $tempLetter to ESP"
+            }
+            else {
+                $tempLetter = $espPartition.DriveLetter
+            }
+
+            if ($tempLetter) {
+                & bcdboot "$env:SystemRoot" /s "$tempLetter`:" /f UEFI 2>&1 |
+                    Out-String |
+                    Write-Host
+                Write-Ok "bcdboot rebuilt UEFI boot files on ${tempLetter}:"
+            }
+            else {
+                # Fall back: bcdboot without /s targets the system partition
+                & bcdboot "$env:SystemRoot" /f UEFI 2>&1 |
+                    Out-String |
+                    Write-Host
+                Write-Ok 'bcdboot rebuilt UEFI boot files (system partition auto-targeted)'
+            }
+        }
+        else {
+            Write-Info 'No GPT EFI System Partition found (MBR or unusual layout). Falling back to bcdboot auto-target.'
+            & bcdboot "$env:SystemRoot" /f UEFI 2>&1 |
+                Out-String |
+                Write-Host
+            Write-Ok 'bcdboot rebuilt UEFI boot files (auto-targeted)'
+        }
+    }
+    catch {
+        Write-Warn "bcdboot step failed: $($_.Exception.Message)"
+    }
+    finally {
+        # Remove the temporary access path we added (do NOT remove a pre-existing letter)
+        if ($espPartition -and $tempLetter -eq 'Z') {
+            try {
+                Remove-PartitionAccessPath -DiskNumber $espPartition.DiskNumber -PartitionNumber $espPartition.PartitionNumber -AccessPath "$tempLetter`:" -ErrorAction SilentlyContinue
+                Write-Info 'Removed temporary ESP drive letter Z:'
+            }
+            catch {}
+        }
+    }
+}
+else {
+    Write-Info '(dry-run) would detect ESP and run: bcdboot C:\Windows /s <ESP>: /f UEFI'
+}
+
 Write-Host @'
 
   NOTE: A full boot store rebuild (bootrec /rebuildbcd) must run from the
@@ -453,19 +570,71 @@ Write-Host @'
 
 '@ -ForegroundColor DarkCyan
 
-if (-not $DryRun) {
-    Write-Step 'Restoring common boot defaults'
-    & bcdedit /set nx AlwaysOn 2>$null | Out-Null
-    Write-Ok 'nx (DEP) set to AlwaysOn'
+# ============================================================================
+# 8. Network stack repair (Safe Mode with Networking)
+# ============================================================================
+Write-Section '8. Network Stack Repair'
+
+Write-Step 'Reset Winsock catalog'
+Invoke-RepairStep 'netsh winsock reset' {
+    & netsh winsock reset 2>&1 |
+        Out-String |
+        Write-Host
+    Write-Info 'Winsock reset (requires reboot to take effect).'
+} | Out-Null
+
+Write-Step 'Reset TCP/IP stack (IPv4)'
+Invoke-RepairStep 'netsh int ip reset' {
+    & netsh int ip reset 2>&1 |
+        Out-String |
+        Write-Host
+} | Out-Null
+
+Write-Step 'Reset TCP/IP stack (IPv6)'
+Invoke-RepairStep 'netsh int ipv6 reset' {
+    & netsh int ipv6 reset 2>&1 |
+        Out-String |
+        Write-Host
+} | Out-Null
+
+Write-Step 'Flush DNS resolver cache'
+Invoke-RepairStep 'ipconfig /flushdns' {
+    & ipconfig /flushdns 2>&1 |
+        Out-String |
+        Write-Host
+} | Out-Null
+
+Write-Ok 'Network stack reset complete (reboot required to apply).'
+
+# ============================================================================
+# 9. Optional: component store cleanup
+# ============================================================================
+Write-Section '9. Component Store Cleanup (optional)'
+
+if ($CleanComponentStore) {
+    Invoke-RepairStep 'DISM /StartComponentCleanup' {
+        & dism /online /cleanup-image /startcomponentcleanup 2>&1 |
+            Out-String |
+            Write-Host
+    } | Out-Null
+
+    Write-Step 'DISM /StartComponentCleanup /ResetBase (further reduce; supersedes old updates)'
+    Invoke-RepairStep 'DISM /StartComponentCleanup /ResetBase' {
+        & dism /online /cleanup-image /startcomponentcleanup /resetbase 2>&1 |
+            Out-String |
+            Write-Host
+        Write-Info 'Note: /ResetBase means previously installed updates can no longer be uninstalled.'
+    } | Out-Null
+    Write-Ok 'Component store cleanup done.'
 }
 else {
-    Write-Info '(dry-run) would set nx AlwaysOn'
+    Write-Info 'Skipped (pass -CleanComponentStore to shrink the component store after repairs).'
 }
 
 # ============================================================================
-# 8. Startup services and driver sanity
+# 10. Startup services, drivers, and Defender defaults
 # ============================================================================
-Write-Section '8. Startup Services and Driver Sanity'
+Write-Section '10. Startup Services, Drivers, and Defender Defaults'
 
 Write-Step 'Automatic services not running'
 if (-not $DryRun) {
@@ -491,23 +660,6 @@ if (-not $DryRun) {
 else {
     Write-Info '(dry-run) would list non-running automatic services'
 }
-
-Write-Host @'
-
-  If the system still fails to boot after this script, try a component
-  store rollback from the Windows Recovery Environment Command Prompt:
-
-     dism /image:C:\ /cleanup-image /revertpendingactions
-
-  Or use System Restore (Advanced Options) to roll back to a point before
-  the failed update.
-
-'@ -ForegroundColor DarkCyan
-
-# ============================================================================
-# 9. Restore update and Defender defaults
-# ============================================================================
-Write-Section '9. Restore Update / Defender Defaults'
 
 Write-Step 'Re-enable Windows Defender services if disabled'
 if (-not $DryRun) {
@@ -537,9 +689,63 @@ else {
 }
 
 # ============================================================================
-# 10. Clean stuck update temp and pending XML
+# 11. System Restore points (list + optional rollback)
 # ============================================================================
-Write-Section '10. Clean Stuck Update Temp / Pending XML'
+Write-Section '11. System Restore Points'
+
+if (-not $DryRun) {
+    try {
+        # Ensure System Restore is queryable; on the system drive
+        $points = Get-ComputerRestorePoint -ErrorAction SilentlyContinue
+        if ($points -and $points.Count -gt 0) {
+            Write-Info 'Available restore points:'
+            $points |
+                Select-Object SequenceNumber, CreationTime, Description |
+                Format-Table -AutoSize |
+                Out-String |
+                Write-Host
+
+            if ($RestorePoint -ge 0) {
+                $target = $points | Where-Object { $_.SequenceNumber -eq $RestorePoint }
+                if ($target) {
+                    Write-Info "Target restore point: Seq $($target.SequenceNumber) - $($target.Description) ($($target.CreationTime))"
+                    $confirm = Read-Host "Roll back to this restore point? This will reboot. [y/N]"
+                    if ($confirm -match '^[yY]') {
+                        Write-Ok 'Starting System Restore rollback...'
+                        Restore-ComputerProperties -RestorePoint $RestorePoint
+                        # Restore-ComputerProperties triggers a reboot; if we reach here, do it explicitly.
+                        & shutdown /r /t 5 /c 'System Restore rollback'
+                        exit 0
+                    }
+                    else {
+                        Write-Info 'Rollback cancelled.'
+                    }
+                }
+                else {
+                    Write-Warn "No restore point with sequence number $RestorePoint. See the list above."
+                }
+            }
+            else {
+                Write-Info 'No -RestorePoint supplied. Re-run with -RestorePoint <SequenceNumber> to roll back.'
+            }
+        }
+        else {
+            Write-Info 'No System Restore points available (System Restore may be disabled on C:).'
+            Write-Info 'If needed, enable it after a stable boot: Enable-ComputerRestore -Drive "C:\"'
+        }
+    }
+    catch {
+        Write-Warn "System Restore query failed: $($_.Exception.Message)"
+    }
+}
+else {
+    Write-Info '(dry-run) would list System Restore points and optionally roll back via -RestorePoint'
+}
+
+# ============================================================================
+# 12. Clean stuck update temp / pending XML
+# ============================================================================
+Write-Section '12. Clean Stuck Update Temp / Pending XML'
 
 if (-not $DryRun) {
     $pendingXml = "$env:SystemRoot\SoftwareDistribution\Download\pending.xml"
@@ -562,9 +768,53 @@ else {
 }
 
 # ============================================================================
-# 11. Summary and next steps
+# 13. Pause Windows Update (now that all repairs are done)
 # ============================================================================
-Write-Section '11. Summary and Next Steps'
+Write-Section '13. Pause Windows Update (post-repair)'
+
+if (-not $DryRun) {
+    $auPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+    if (-not (Test-Path $auPath)) {
+        New-Item -Path $auPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path $auPath -Name 'NoAutoUpdate' -Value 1 -Type DWord -Force
+    Write-Ok 'Auto-update disabled via policy (so the bad update is not re-delivered).'
+}
+else {
+    Write-Info '(dry-run) would set NoAutoUpdate policy now that repairs are complete'
+}
+
+# ============================================================================
+# 14. Optional: schedule Windows Memory Diagnostic for next boot
+# ============================================================================
+Write-Section '14. Memory Diagnostic (optional)'
+
+if ($ScheduleMemTest) {
+    Write-Step 'Launch Windows Memory Diagnostic'
+    if (-not $DryRun) {
+        try {
+            # mdsched.exe opens a small dialog to choose "Restart now" or
+            # "Check for problems the next time I start my computer".
+            Start-Process -FilePath 'mdsched.exe' -ErrorAction Stop
+            Write-Ok 'Windows Memory Diagnostic launched. Choose "Check on next start" to schedule it.'
+            Write-Info 'The test runs after the next reboot and shows results on the following boot.'
+        }
+        catch {
+            Write-Warn "Could not launch mdsched.exe: $($_.Exception.Message)"
+        }
+    }
+    else {
+        Write-Info '(dry-run) would launch mdsched.exe for scheduling'
+    }
+}
+else {
+    Write-Info 'Skipped (pass -ScheduleMemTest to launch Windows Memory Diagnostic).'
+}
+
+# ============================================================================
+# 15. Summary and next steps
+# ============================================================================
+Write-Section '15. Summary and Next Steps'
 
 if ($anyFailures) {
     Write-Warn 'Some steps reported failures. Review the output above before rebooting.'
@@ -573,16 +823,25 @@ else {
     Write-Ok 'All repair steps attempted without hard failures.'
 }
 
+if ($wimSourceUsed) {
+    Write-Info 'Offline install.wim source was used for DISM /RestoreHealth.'
+}
+else {
+    Write-Info 'DISM /RestoreHealth used Windows Update (cloud) as the repair source.'
+}
+
 Write-Host @'
 
   RECOMMENDED NEXT STEPS
   ----------------------
   1. If you know the exact bad KB, re-run with -BadKb <number> (without -DryRun).
   2. Reboot to NORMAL mode:  shutdown /r /t 0
-     If CHKDSK was scheduled, it will run automatically first.
+     - CHKDSK runs first if scheduled.
+     - Network stack reset applies on reboot.
+     - Memory Diagnostic runs first if you scheduled it.
   3. If boot STILL fails:
        a. Boot from Windows 11 install media > Repair your computer >
-          Advanced Options > System Restore.
+          Advanced Options > System Restore (or use -RestorePoint <seq>).
        b. Or Advanced Options > Uninstall Updates (quality / feature).
        c. Or Command Prompt > run:
             bootrec /rebuildbcd
@@ -593,7 +852,7 @@ Write-Host @'
 '@ -ForegroundColor White
 
 # ============================================================================
-# 12. Reboot
+# 16. Reboot
 # ============================================================================
 if ($NoReboot) {
     Write-Info 'NoReboot specified. Done. Reboot manually when ready.'
@@ -605,7 +864,7 @@ if ($DryRun) {
     exit 0
 }
 
-$answer = Read-Host "`nReboot now to apply repairs (CHKDSK runs first if scheduled)? [y/N]"
+$answer = Read-Host "`nReboot now to apply repairs (CHKDSK / memory test run first if scheduled)? [y/N]"
 if ($answer -match '^[yY]') {
     Write-Ok 'Rebooting in 5 seconds...'
     & shutdown /r /t 5 /c 'Windows 11 Boot Repair - rebooting to apply fixes'
