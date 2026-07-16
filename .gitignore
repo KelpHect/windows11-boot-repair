@@ -1,0 +1,11 @@
+# Dependencies / build outputs
+*.log
+*.bak
+RepairBackup_*/
+
+# pi agent state (not part of this project)
+.pi/
+
+# Local user state
+.vs/
+.idea/
